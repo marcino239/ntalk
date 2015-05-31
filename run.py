@@ -27,6 +27,7 @@ import importlib
 import sys
 import csv
 import datetime
+import cPickle as pickle
 
 from nupic.data.inference_shifter import InferenceShifter
 from nupic.frameworks.opf.metrics import MetricSpec
@@ -44,49 +45,52 @@ DESCRIPTION = (
   "NOTE: You must run ./swarm.py before this, because model parameters\n"
   "are required to run NuPIC.\n"
 )
-GYM_NAME = "rec-center-hourly"
-DATA_DIR = "."
-MODEL_PARAMS_DIR = "./model_params"
+TEXT_NAME = 'sequence'
+WORD_LIST_FILE = 'word_encodings.pkl'
+DATA_DIR = '.'
+MODEL_PARAMS_DIR = './model_params'
 # '7/2/10 0:00'
-DATE_FORMAT = "%m/%d/%y %H:%M"
+DATE_FORMAT = '%m/%d/%y %H:%M'
+
+MODEL_DIR = 'model'
 
 _METRIC_SPECS = (
-    MetricSpec(field='kw_energy_consumption', metric='multiStep',
+    MetricSpec(field='word_num', metric='multiStep',
                inferenceElement='multiStepBestPredictions',
                params={'errorMetric': 'aae', 'window': 1000, 'steps': 1}),
-    MetricSpec(field='kw_energy_consumption', metric='trivial',
+    MetricSpec(field='word_num', metric='trivial',
                inferenceElement='prediction',
                params={'errorMetric': 'aae', 'window': 1000, 'steps': 1}),
-    MetricSpec(field='kw_energy_consumption', metric='multiStep',
+    MetricSpec(field='word_num', metric='multiStep',
                inferenceElement='multiStepBestPredictions',
                params={'errorMetric': 'altMAPE', 'window': 1000, 'steps': 1}),
-    MetricSpec(field='kw_energy_consumption', metric='trivial',
+    MetricSpec(field='word_num', metric='trivial',
                inferenceElement='prediction',
                params={'errorMetric': 'altMAPE', 'window': 1000, 'steps': 1}),
 )
 
 def createModel(modelParams):
   model = ModelFactory.create(modelParams)
-  model.enableInference({"predictedField": "kw_energy_consumption"})
+  model.enableInference({"predictedField": "word_num"})
   return model
 
 
 
-def getModelParamsFromName(gymName):
+def getModelParamsFromName(textName):
   importName = "model_params.%s_model_params" % (
-    gymName.replace(" ", "_").replace("-", "_")
+    textName.replace(" ", "_").replace("-", "_")
   )
   print "Importing model params from %s" % importName
   try:
     importedModelParams = importlib.import_module(importName).MODEL_PARAMS
   except ImportError:
     raise Exception("No model params exist for '%s'. Run swarm first!"
-                    % gymName)
+                    % textName)
   return importedModelParams
 
 
 
-def runIoThroughNupic(inputData, model, gymName, plot):
+def runIoThroughNupic( inputData, model, textName, word_list ):
   inputFile = open(inputData, "rb")
   csvReader = csv.reader(inputFile)
   # skip header rows
@@ -95,23 +99,26 @@ def runIoThroughNupic(inputData, model, gymName, plot):
   csvReader.next()
 
   shifter = InferenceShifter()
-  if plot:
-    output = nupic_output.NuPICPlotOutput([gymName])
-  else:
-    output = nupic_output.NuPICFileOutput([gymName])
+  output = nupic_output.NuPICFileOutput([textName])
 
   metricsManager = MetricsManager(_METRIC_SPECS, model.getFieldInfo(),
                                   model.getInferenceType())
 
+  model.enableLearning()
   counter = 0
   for row in csvReader:
     counter += 1
-    timestamp = datetime.datetime.strptime(row[0], DATE_FORMAT)
-    consumption = float(row[1])
+    reset_flag = bool( row[0] )
+    word_num = int( row[1] )
+
+    if reset_flag:
+      print( 'resetting model' )
+      model.resetSequenceStates()
+
     result = model.run({
-      "timestamp": timestamp,
-      "kw_energy_consumption": consumption
+      "word_num": word_num
     })
+
     result.metrics = metricsManager.update(result)
 
     if counter % 100 == 0:
@@ -119,24 +126,27 @@ def runIoThroughNupic(inputData, model, gymName, plot):
       print ("After %i records, 1-step altMAPE=%f", counter,
               result.metrics["multiStepBestPredictions:multiStep:"
                              "errorMetric='altMAPE':steps=1:window=1000:"
-                             "field=kw_energy_consumption"])
+                             "field=word_num"])
  
-    if plot:
-      result = shifter.shift(result)
+  model.finishLearning()
+  model.save( MODEL_DIR )
 
-    prediction = result.inferences["multiStepBestPredictions"][1]
-    output.write([timestamp], [consumption], [prediction])
 
   inputFile.close()
   output.close()
 
 
 
-def runModel(gymName, plot=False):
-  print "Creating model from %s..." % gymName
-  model = createModel(getModelParamsFromName(gymName))
-  inputData = "%s/%s.csv" % (DATA_DIR, gymName.replace(" ", "_"))
-  runIoThroughNupic(inputData, model, gymName, plot)
+def runModel( textName, word_list_file ):
+
+  print( 'Loading word list' )
+  word_list = pickle.load( open( word_list_file, 'rb' ) )
+  print( 'Got %d words' % len( word_list ) )
+
+  print "Creating model from %s..." % textName
+  model = createModel(getModelParamsFromName( textName ))
+  inputData = "%s/%s.csv" % (DATA_DIR, textName.replace(" ", "_"))
+  runIoThroughNupic(inputData, model, textName, word_list )
 
 
 
@@ -144,6 +154,4 @@ if __name__ == "__main__":
   print DESCRIPTION
   plot = False
   args = sys.argv[1:]
-  if "--plot" in args:
-    plot = True
-  runModel(GYM_NAME, plot=plot)
+  runModel( TEXT_NAME, WORD_LIST_FILE )
